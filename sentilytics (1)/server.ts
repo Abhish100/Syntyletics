@@ -19,7 +19,7 @@ const __dirname = path.dirname(__filename);
 // Using the explicitly provided URI from the user
 const rawUri = process.env.MONGODB_URI && !process.env.MONGODB_URI.includes('cluster0.qv0oqyy') 
   ? process.env.MONGODB_URI 
-  : "mongodb+srv://as9423320_db_user:YVTzl9wyH886qlGq@sentilytics.0tu8yne.mongodb.net/?appName=Sentilytics";
+  : "";
 
 // Robust URI handling for passwords containing '@'
 let MONGODB_URI = rawUri;
