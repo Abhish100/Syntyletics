@@ -12,11 +12,10 @@ import {
   Search, Youtube, MessageSquare, TrendingUp, History, 
   BarChart3, PieChart as PieChartIcon, AlertCircle, 
   CheckCircle2, Loader2, Github, ExternalLink,
-  ThumbsUp, User, Calendar, Trash2, RefreshCw, Info,
-  Sparkles, Lightbulb, Target, ArrowRight, Zap, LogIn, LogOut, Mail, Key
+  ThumbsUp, User, Calendar, Trash2, Info,
+  Sparkles, Lightbulb, Target, ArrowRight, Zap, LogIn, LogOut, Mail, Key, RefreshCw
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
-import { GoogleGenAI, Type } from "@google/genai";
 import Markdown from 'react-markdown';
 import Papa from 'papaparse';
 import { format } from 'date-fns';
@@ -37,7 +36,7 @@ interface Comment {
   sentiment?: 'positive' | 'neutral' | 'negative';
 }
 
-type Algorithm = 'gemini' | 'naive_bayes' | 'svm';
+type Algorithm = 'logistic_regression' | 'naive_bayes' | 'svm';
 
 interface User {
   id: string;
@@ -61,13 +60,13 @@ interface AnalysisResult {
 // --- Constants ---
 
 const ALGORITHM_INFO = {
-  gemini: {
-    name: "Gemini AI (LLM)",
+  logistic_regression: {
+    name: "Logistic Regression (ML)",
     icon: Sparkles,
-    description: "State-of-the-art Large Language Model that understands deep context, sarcasm, and linguistic nuance.",
-    howItWorks: "Uses advanced neural networks to analyze the semantic meaning and 'vibe' of text, rather than just matching keywords.",
-    bestFor: "High-accuracy requirements where understanding subtle human emotion is critical.",
-    limitations: "Higher latency due to API calls and subject to rate limits."
+    description: "A fast linear model that estimates sentiment probabilities using weighted text features.",
+    howItWorks: "Applies logistic regression to text features so sentiment is predicted with a stable, interpretable model.",
+    bestFor: "Reliable sentiment classification without external API dependencies.",
+    limitations: "Less nuanced than LLMs but much faster and works entirely locally."
   },
   naive_bayes: {
     name: "Naive Bayes (ML)",
@@ -168,7 +167,7 @@ const InfoTooltip = ({ children, content }: { children: React.ReactNode; content
 
 export default function App() {
   const [source, setSource] = useState<'youtube' | 'dataset'>('youtube');
-  const [algorithm, setAlgorithm] = useState<Algorithm>('gemini');
+  const [algorithm, setAlgorithm] = useState<Algorithm>('logistic_regression');
   const [input, setInput] = useState('');
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [analysisProgress, setAnalysisProgress] = useState({ current: 0, total: 0 });
@@ -423,110 +422,82 @@ export default function App() {
   };
 
   const analyzeSentiment = async (comments: Comment[]) => {
-    const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY! });
+    const runBatchPrediction = async () => {
+      const commentTexts = comments.map(c => c.text);
+      const res = await fetch(`${window.location.origin}/api/predict_batch`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({ texts: commentTexts, algorithm })
+      });
 
-    const retryWithBackoff = async (fn: () => Promise<any>, maxRetries = 5, initialDelay = 2000) => {
-      let retries = 0;
-      while (retries < maxRetries) {
-        try {
-          return await fn();
-        } catch (err: any) {
-          const isRateLimit = err.message?.includes('429') || err.status === 429 || JSON.stringify(err).includes('429');
-          if (isRateLimit && retries < maxRetries - 1) {
-            const delay = initialDelay * Math.pow(2, retries);
-            console.log(`Rate limit hit. Retrying in ${delay}ms... (Attempt ${retries + 1}/${maxRetries})`);
-            await new Promise(resolve => setTimeout(resolve, delay));
-            retries++;
-          } else {
-            throw err;
-          }
-        }
+      if (!res.ok) {
+        throw new Error(`Batch prediction failed: ${res.status}`);
       }
+
+      const data = await res.json();
+      if (!data.results || !Array.isArray(data.results)) {
+        throw new Error("Invalid response format from batch prediction");
+      }
+
+      return comments.map((comment, index) => ({
+        text: comment.text || '',
+        author: comment.author || 'Anonymous',
+        likes: comment.likes || 0,
+        publishedAt: comment.publishedAt || new Date().toISOString(),
+        sentiment: (data.results[index]?.sentiment || "neutral") as any
+      }));
     };
 
-    if (algorithm === 'gemini') {
-      const batchSize = 20; // Increased batch size to reduce total requests
-      const analyzedComments: Comment[] = new Array(comments.length);
-      setAnalysisProgress({ current: 0, total: comments.length });
-      
-      const batches = [];
-      for (let i = 0; i < comments.length; i += batchSize) {
-        batches.push({
-          index: i,
-          batch: comments.slice(i, i + batchSize)
+    setAnalysisProgress({ current: 0, total: comments.length });
+
+    try {
+      const analyzedComments = await runBatchPrediction();
+      setAnalysisProgress({ current: comments.length, total: comments.length });
+      return analyzedComments;
+    } catch (err: any) {
+      console.error("Batch ML API error:", err);
+      const analyzedComments: Comment[] = [];
+
+      for (let i = 0; i < comments.length; i++) {
+        const comment = comments[i];
+
+        try {
+          const res = await fetch(`${window.location.origin}/api/predict`, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json"
+            },
+            body: JSON.stringify({ text: comment.text, algorithm })
+          });
+
+          const data = await res.json();
+          analyzedComments.push({
+            text: comment.text || '',
+            author: comment.author || 'Anonymous',
+            likes: comment.likes || 0,
+            publishedAt: comment.publishedAt || new Date().toISOString(),
+            sentiment: data.sentiment || "neutral"
+          });
+        } catch (individualErr) {
+          console.error("Individual ML API error:", individualErr);
+          analyzedComments.push({
+            text: comment.text || '',
+            author: comment.author || 'Anonymous',
+            likes: comment.likes || 0,
+            publishedAt: comment.publishedAt || new Date().toISOString(),
+            sentiment: "neutral"
+          });
+        }
+
+        setAnalysisProgress({
+          current: i + 1,
+          total: comments.length
         });
       }
 
-      // Process batches sequentially (concurrency = 1) to be safe with free tier limits
-      for (let i = 0; i < batches.length; i++) {
-        const { index, batch } = batches[i];
-        
-        const prompt = `Analyze the sentiment of the following social media comments. 
-        Classify each as 'positive', 'neutral', or 'negative'.
-        Return ONLY a JSON array of strings in the same order.
-        
-        Comments:
-        ${batch.map((c, idx) => `${idx + 1}. ${c.text}`).join('\n')}`;
-
-        try {
-          const response = await retryWithBackoff(() => ai.models.generateContent({
-            model: "gemini-3-flash-preview",
-            contents: prompt,
-            config: {
-              responseMimeType: "application/json",
-              responseSchema: {
-                type: Type.ARRAY,
-                items: { type: Type.STRING }
-              }
-            }
-          }));
-
-          const sentiments = JSON.parse(response.text || '[]');
-          batch.forEach((comment, idx) => {
-            analyzedComments[index + idx] = {
-              ...comment,
-              sentiment: (sentiments[idx] || 'neutral').toLowerCase() as any
-            };
-          });
-        } catch (err: any) {
-          console.error("Gemini analysis error", err);
-          const isRateLimit = err.message?.includes('429') || err.status === 429;
-          if (isRateLimit) {
-            setError("Gemini API quota exceeded. Switching to local analysis for remaining comments or try again later.");
-          }
-          batch.forEach((comment, idx) => {
-            if (!analyzedComments[index + idx]) {
-              analyzedComments[index + idx] = { ...comment, sentiment: 'neutral' };
-            }
-          });
-        }
-        
-        setAnalysisProgress(prev => ({ 
-          ...prev, 
-          current: Math.min(prev.current + batch.length, prev.total) 
-        }));
-
-        // 1 second delay between batches to stay under RPM limits
-        if (i < batches.length - 1) {
-          await new Promise(resolve => setTimeout(resolve, 1000));
-        }
-      }
       return analyzedComments;
-    } else {
-      // Server-side ML analysis for Naive Bayes/SVM
-      const res = await fetch(`${window.location.origin}/api/analyze-ml`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ comments, algorithm })
-      });
-      const text = await res.text();
-      try {
-        const data = JSON.parse(text);
-        return data.analyzed;
-      } catch (e) {
-        console.error("ML Analysis: invalid JSON", text);
-        throw new Error("Server returned invalid response format for ML analysis");
-      }
     }
   };
 
@@ -572,63 +543,7 @@ export default function App() {
         return acc;
       }, { positive: 0, neutral: 0, negative: 0 });
 
-      // Generate Suggestions using Gemini
-      let suggestions = "";
-      try {
-        const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY! });
-        const topPositive = analyzed.filter(c => c.sentiment === 'positive').slice(0, 5).map(c => c.text).join('\n');
-        const topNegative = analyzed.filter(c => c.sentiment === 'negative').slice(0, 5).map(c => c.text).join('\n');
-        
-        const suggestionPrompt = `Based on the following sentiment analysis results for "${target}":
-        - Positive: ${counts.positive} (${Math.round((counts.positive / analyzed.length) * 100)}%)
-        - Neutral: ${counts.neutral} (${Math.round((counts.neutral / analyzed.length) * 100)}%)
-        - Negative: ${counts.negative} (${Math.round((counts.negative / analyzed.length) * 100)}%)
-        - Total Comments: ${analyzed.length}
-
-        Sample Positive Comments:
-        ${topPositive || "None"}
-
-        Sample Negative Comments:
-        ${topNegative || "None"}
-
-        Please provide a concise analysis in Markdown format:
-        1. **What is working well?** (Identify themes in positive feedback)
-        2. **What needs improvement?** (Identify specific issues or pain points)
-        3. **Actionable Recommendations** (3-4 specific steps to improve the content or engagement)
-        
-        Keep it professional, constructive, and insightful.`;
-
-        const retryWithBackoff = async (fn: () => Promise<any>, maxRetries = 5, initialDelay = 2000) => {
-          let retries = 0;
-          while (retries < maxRetries) {
-            try {
-              return await fn();
-            } catch (err: any) {
-              const isRateLimit = err.message?.includes('429') || err.status === 429 || JSON.stringify(err).includes('429');
-              if (isRateLimit && retries < maxRetries - 1) {
-                const delay = initialDelay * Math.pow(2, retries);
-                console.log(`Rate limit hit on suggestions. Retrying in ${delay}ms...`);
-                await new Promise(resolve => setTimeout(resolve, delay));
-                retries++;
-              } else {
-                throw err;
-              }
-            }
-          }
-        };
-
-        const suggestionResponse = await retryWithBackoff(() => ai.models.generateContent({
-          model: "gemini-3-flash-preview",
-          contents: suggestionPrompt,
-        }));
-        suggestions = suggestionResponse.text || "No suggestions available.";
-      } catch (sugErr: any) {
-        console.error("Failed to generate suggestions", sugErr);
-        const isRateLimit = sugErr.message?.includes('429') || sugErr.status === 429;
-        suggestions = isRateLimit 
-          ? "Analysis complete, but AI suggestions could not be generated due to API rate limits. Please try again later."
-          : "Analysis complete, but AI suggestions could not be generated at this time.";
-      }
+      const suggestions = "Sentiment analysis is complete. Review the model results and use the counts to identify positive, neutral, and negative trends in your text data.";
 
       const analysisData = {
         source,
@@ -691,7 +606,11 @@ export default function App() {
         setCurrentAnalysis(data);
         setSource(data.source);
         setInput(data.target);
-        setAlgorithm(data.algorithm || 'gemini');
+        setAlgorithm(
+          data.algorithm === 'logistic_regression' || data.algorithm === 'svm' || data.algorithm === 'naive_bayes'
+            ? data.algorithm
+            : 'logistic_regression'
+        );
       } catch (e) {
         console.error("Load analysis: invalid JSON", text);
         alert("Failed to load analysis: invalid response format");
@@ -713,6 +632,28 @@ export default function App() {
   }, [currentAnalysis]);
 
   const [apiStatus, setApiStatus] = useState<'checking' | 'ok' | 'error'>('checking');
+  const [runtimeError, setRuntimeError] = useState<string | null>(null);
+
+  useEffect(() => {
+    const handleError = (event: ErrorEvent) => {
+      setRuntimeError(event.message || 'An unknown runtime error occurred');
+      console.error('Runtime error:', event.error || event.message, event.filename, event.lineno, event.colno);
+    };
+
+    const handleRejection = (event: PromiseRejectionEvent) => {
+      const message = event.reason?.message || String(event.reason || 'Unhandled promise rejection');
+      setRuntimeError(message);
+      console.error('Unhandled promise rejection:', event.reason);
+    };
+
+    window.addEventListener('error', handleError);
+    window.addEventListener('unhandledrejection', handleRejection);
+
+    return () => {
+      window.removeEventListener('error', handleError);
+      window.removeEventListener('unhandledrejection', handleRejection);
+    };
+  }, []);
 
   useEffect(() => {
     const checkApi = async () => {
@@ -890,15 +831,21 @@ export default function App() {
   return (
     <div className="min-h-screen bg-[#0F0F1A] text-slate-200 font-sans selection:bg-magic-gold/30 relative overflow-x-hidden">
       <SparkleEffect />
-      
+      {runtimeError && (
+        <div className="fixed inset-x-0 top-24 z-50 mx-auto max-w-4xl px-6">
+          <div className="rounded-3xl border border-rose-500/40 bg-rose-500/10 p-5 text-rose-100 shadow-2xl backdrop-blur-xl">
+            <p className="text-sm font-bold">Runtime error detected</p>
+            <p className="text-xs text-rose-200 mt-1">{runtimeError}</p>
+          </div>
+        </div>
+      )}
       {/* Header */}
-      <header className="bg-magic-blue/60 backdrop-blur-md border-b border-white/5 sticky top-0 z-50">
-        <div className="max-w-7xl mx-auto px-6 h-20 flex items-center justify-between">
-          <motion.div 
-            initial={{ opacity: 0, x: -20 }}
-            animate={{ opacity: 1, x: 0 }}
-            className="flex items-center gap-3"
-          >
+      <header className="max-w-7xl mx-auto px-6 h-20 flex items-center justify-between">
+        <motion.div 
+          initial={{ opacity: 0, x: -20 }}
+          animate={{ opacity: 1, x: 0 }}
+          className="flex items-center gap-3"
+        >
             <div className="w-10 h-10 bg-gradient-to-br from-magic-gold to-magic-purple rounded-2xl flex items-center justify-center text-white shadow-lg shadow-magic-purple/20">
               <Sparkles size={24} className="animate-pulse" />
             </div>
@@ -920,44 +867,13 @@ export default function App() {
                 <LogOut size={16} />
               </button>
             </div>
-            <div className="h-6 w-px bg-white/10" />
-            <button 
-              onClick={() => window.location.reload()}
-              className="p-2 text-slate-400 hover:text-magic-gold transition-all hover:rotate-180 duration-500"
-            >
-              <RefreshCw size={20} />
-            </button>
-            <div className="h-6 w-px bg-white/10" />
-            <a href="https://github.com" target="_blank" rel="noreferrer" className="text-slate-400 hover:text-white transition-colors">
-              <Github size={20} />
-            </a>
           </div>
-        </div>
       </header>
 
       <main className="max-w-7xl mx-auto px-6 py-12 grid grid-cols-1 lg:grid-cols-12 gap-10 relative z-10">
         {/* Sidebar / Controls */}
-        <div className="lg:col-span-4 space-y-8">
-          <Card className="p-8 bg-gradient-to-br from-magic-purple/20 to-magic-indigo/20 border-white/10 relative group">
-            <div className="absolute top-0 right-0 p-4 opacity-20 group-hover:opacity-100 transition-opacity">
-              <Lightbulb size={40} className="text-magic-gold" />
-            </div>
-            <h2 className="text-xs font-bold uppercase tracking-[0.2em] text-magic-gold mb-3">The Magic Portal</h2>
-            <p className="text-sm leading-relaxed text-slate-300 mb-6 font-light">
-              Unlock the hidden emotions within your social data. Sentilytics weaves AI magic to reveal what your audience truly feels.
-            </p>
-            <div className="grid grid-cols-2 gap-3">
-              <div className="bg-white/5 rounded-2xl p-3 border border-white/5 text-center">
-                <p className="text-[9px] font-bold uppercase text-slate-500 mb-1">Intelligence</p>
-                <p className="text-xs font-bold text-slate-200">Gemini AI</p>
-              </div>
-              <div className="bg-white/5 rounded-2xl p-3 border border-white/5 text-center">
-                <p className="text-[9px] font-bold uppercase text-slate-500 mb-1">Precision</p>
-                <p className="text-xs font-bold text-slate-200">99.9% Pure</p>
-              </div>
-            </div>
-          </Card>
 
+        <div className="lg:col-span-4 space-y-8">
           <Card className="p-8">
             <h2 className="text-xs font-bold text-slate-500 uppercase tracking-[0.2em] mb-6">Cast a Spell</h2>
             <div className="space-y-6">
@@ -988,8 +904,8 @@ export default function App() {
                   <InfoTooltip content={
                     <div className="space-y-4">
                       <div>
-                        <p className="text-[10px] font-bold text-magic-gold uppercase mb-1">Gemini AI (LLM)</p>
-                        <p className="text-[10px] leading-relaxed text-slate-300">The most powerful magic. Understands the deepest nuances of human speech.</p>
+                        <p className="text-[10px] font-bold text-magic-gold uppercase mb-1">Logistic Regression (ML)</p>
+                        <p className="text-[10px] leading-relaxed text-slate-300">A stable local model that predicts sentiment from weighted text features without external API calls.</p>
                       </div>
                       <div className="pt-2 border-t border-white/10">
                         <p className="text-[10px] font-bold text-magic-indigo uppercase mb-1">Naive Bayes (ML)</p>
@@ -1005,7 +921,7 @@ export default function App() {
                   onChange={(e) => setAlgorithm(e.target.value as Algorithm)}
                   className="w-full px-4 py-3 bg-white/5 border border-white/10 rounded-2xl text-sm outline-none focus:ring-2 focus:ring-magic-purple/30 transition-all text-slate-200 appearance-none cursor-pointer"
                 >
-                  <option value="gemini" className="bg-magic-blue">Gemini AI (LLM)</option>
+                  <option value="logistic_regression" className="bg-magic-blue">Logistic Regression (ML)</option>
                   <option value="naive_bayes" className="bg-magic-blue">Naive Bayes (ML)</option>
                   <option value="svm" className="bg-magic-blue">Support Vector Machine (SVM)</option>
                 </select>
@@ -1258,6 +1174,7 @@ export default function App() {
                   <h3 className="text-sm font-bold text-slate-100 uppercase tracking-[0.2em] mb-8 flex items-center gap-2">
                     <PieChartIcon size={18} className="text-magic-gold" /> Sentiment Distribution
                   </h3>
+                  <div className="space-y-8">
                   <div className="h-72">
                     <ResponsiveContainer width="100%" height="100%">
                       <PieChart>
@@ -1283,6 +1200,32 @@ export default function App() {
                       </PieChart>
                     </ResponsiveContainer>
                   </div>
+
+                  <div className="h-72 p-4 bg-slate-950/70 rounded-[2rem] border border-white/5">
+                    <div className="flex items-center justify-between mb-4">
+                      <div>
+                        <p className="text-sm font-bold text-slate-100 uppercase tracking-[0.2em]">Sentiment Counts</p>
+                        <p className="text-[10px] text-slate-500">Comparison of positive, neutral and negative comment totals.</p>
+                      </div>
+                    </div>
+                    <ResponsiveContainer width="100%" height="100%">
+                      <BarChart data={chartData} margin={{ top: 8, right: 8, left: -12, bottom: 8 }}>
+                        <CartesianGrid strokeDasharray="3 3" stroke="rgba(148,163,184,0.18)" />
+                        <XAxis dataKey="name" tick={{ fill: '#94a3b8', fontSize: 12 }} axisLine={false} tickLine={false} />
+                        <YAxis tick={{ fill: '#94a3b8', fontSize: 12 }} axisLine={false} tickLine={false} />
+                        <Tooltip 
+                          contentStyle={{ backgroundColor: '#0f172a', border: '1px solid rgba(255,255,255,0.1)', borderRadius: '1rem' }}
+                          itemStyle={{ color: '#fff', fontSize: '12px' }}
+                        />
+                        <Bar dataKey="value" radius={[12,12,0,0]}>
+                          {chartData.map((entry, index) => (
+                            <Cell key={`bar-cell-${index}`} fill={entry.color} />
+                          ))}
+                        </Bar>
+                      </BarChart>
+                    </ResponsiveContainer>
+                  </div>
+                </div>
                 </Card>
 
                 <Card className="p-8 bg-gradient-to-br from-magic-purple/10 to-transparent border-magic-purple/20">
@@ -1317,11 +1260,15 @@ export default function App() {
                       <div className="flex items-start justify-between gap-4 mb-3">
                         <div className="flex items-center gap-3">
                           <div className="w-8 h-8 rounded-full bg-gradient-to-br from-slate-700 to-slate-800 flex items-center justify-center text-[10px] font-bold text-slate-300">
-                            {comment.author[0].toUpperCase()}
+                            {(comment.author?.[0] || 'A').toUpperCase()}
                           </div>
                           <div>
-                            <p className="text-xs font-bold text-slate-200">{comment.author}</p>
-                            <p className="text-[10px] text-slate-500">{comment.publishedAt ? format(new Date(comment.publishedAt), 'MMM d, yyyy') : 'Recently'}</p>
+                            <p className="text-xs font-bold text-slate-200">{comment.author || 'Anonymous'}</p>
+                            <p className="text-[10px] text-slate-500">
+                              {comment.publishedAt && !isNaN(new Date(comment.publishedAt).getTime())
+                                ? format(new Date(comment.publishedAt), 'MMM d, yyyy')
+                                : 'Recently'}
+                            </p>
                           </div>
                         </div>
                         <Badge sentiment={comment.sentiment || 'neutral'} />

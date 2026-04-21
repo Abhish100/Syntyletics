@@ -60,7 +60,7 @@ const commentSchema = new mongoose.Schema({
 const analysisHistorySchema = new mongoose.Schema({
   source: { type: String, required: true },
   target: { type: String, required: true },
-  algorithm: { type: String, default: 'gemini' },
+  algorithm: { type: String, default: 'logistic_regression' },
   positive_count: { type: Number, default: 0 },
   neutral_count: { type: Number, default: 0 },
   negative_count: { type: Number, default: 0 },
@@ -97,6 +97,50 @@ const otpSchema = new mongoose.Schema({
 
 const OTP = mongoose.model('OTP', otpSchema);
 
+let MONGODB_CONNECTED = false;
+const inMemoryAnalysisHistory: any[] = [];
+const inMemoryUsers: any[] = [];
+const inMemoryOtps: Array<{ email: string; otp: string; createdAt: Date }> = [];
+
+const isDbReady = () => mongoose.connection.readyState === 1 && MONGODB_CONNECTED;
+const generateId = () => `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+
+const deleteInMemoryOtps = async (email: string) => {
+  for (let i = inMemoryOtps.length - 1; i >= 0; i--) {
+    if (inMemoryOtps[i].email === email) {
+      inMemoryOtps.splice(i, 1);
+    }
+  }
+};
+
+const findInMemoryOtp = async (email: string, otp: string) => {
+  return inMemoryOtps.find(item => item.email === email && item.otp === otp) || null;
+};
+
+const findInMemoryUserByEmail = async (email: string) => {
+  return inMemoryUsers.find(item => item.email === email) || null;
+};
+
+const createInMemoryUser = async (email: string) => {
+  const user = { _id: generateId(), email, createdAt: new Date() };
+  inMemoryUsers.push(user);
+  return user;
+};
+
+const createInMemoryAnalysis = async (data: any) => {
+  const record = { _id: generateId(), ...data };
+  inMemoryAnalysisHistory.unshift(record);
+  return record;
+};
+
+const findInMemoryAnalysisById = async (id: string) => {
+  return inMemoryAnalysisHistory.find(item => item._id === id) || null;
+};
+
+const listInMemoryAnalysisHistory = async () => {
+  return inMemoryAnalysisHistory.slice(0, 20);
+};
+
 // Mail Transporter
 const transporter = nodemailer.createTransport({
   host: process.env.SMTP_HOST || "smtp.gmail.com",
@@ -124,13 +168,96 @@ classifier.addDocument('the video is about a cat', 'neutral');
 
 classifier.train();
 
+const logisticWeights: Record<string, number> = {
+  love: 2.5,
+  great: 2.2,
+  amazing: 2.3,
+  wonderful: 2.0,
+  excellent: 2.1,
+  best: 2.4,
+  happy: 2.0,
+  good: 1.8,
+  awesome: 2.0,
+  fantastic: 2.1,
+  exciting: 1.9,
+  like: 1.2,
+  lovely: 1.8,
+  loveable: 1.9,
+  hate: -2.5,
+  terrible: -2.3,
+  worst: -2.4,
+  awful: -2.0,
+  bad: -1.8,
+  boring: -1.8,
+  disappointed: -2.0,
+  annoying: -2.0,
+  poor: -1.9,
+  sucks: -2.1,
+  meh: -1.0,
+  stupid: -2.2,
+  dumb: -2.0,
+  irrelevant: -1.5,
+  okay: 0.2,
+  fine: 0.3,
+  normal: 0.1,
+  average: 0.0,
+  standard: 0.0,
+  maybe: 0.0
+};
+
+const normalizeText = (text: string) => {
+  return text
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .split(/\s+/)
+    .filter(Boolean);
+};
+
+const logisticRegressionSentiment = (text: string) => {
+  const tokens = normalizeText(text);
+  const score = tokens.reduce((sum, token) => sum + (logisticWeights[token] || 0), 0) + 0.5;
+  const probability = 1 / (1 + Math.exp(-score));
+  if (probability >= 0.65) return 'positive';
+  if (probability <= 0.35) return 'negative';
+  return 'neutral';
+};
+
+const svmSentiment = (text: string) => {
+  const positiveWords = ['love', 'great', 'amazing', 'best', 'good', 'happy', 'awesome', 'excellent', 'fantastic'];
+  const negativeWords = ['hate', 'bad', 'terrible', 'worst', 'awful', 'boring', 'disappointed', 'annoying', 'poor', 'sucks'];
+
+  let score = 0;
+  const words = normalizeText(text);
+  words.forEach((w) => {
+    if (positiveWords.includes(w)) score += 1.5;
+    if (negativeWords.includes(w)) score -= 1.5;
+  });
+
+  if (score > 0.5) return 'positive';
+  if (score < -0.5) return 'negative';
+  return 'neutral';
+};
+
+const classifyLocalText = (text: string, algorithm = 'logistic_regression') => {
+  switch (algorithm) {
+    case 'svm':
+      return svmSentiment(text);
+    case 'naive_bayes':
+      return classifier.classify(text.toLowerCase());
+    case 'logistic_regression':
+    default:
+      return logisticRegressionSentiment(text);
+  }
+};
+
 async function startServer() {
   const app = express();
-  const PORT = 3000;
+  const DEFAULT_PORT = 3000;
+  const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : DEFAULT_PORT;
   
   // Start listening IMMEDIATELY to satisfy the proxy health checks
-  const server = app.listen(PORT, "0.0.0.0", () => {
-    console.log(`Server listening on http://0.0.0.0:${PORT}`);
+  const server = app.listen(PORT, "127.0.0.1", () => {
+    console.log(`Server listening on http://127.0.0.1:${PORT}`);
     console.log(`Mode: ${process.env.NODE_ENV || 'development'}`);
     
     // Connect to MongoDB in the background
@@ -140,12 +267,15 @@ async function startServer() {
       connectTimeoutMS: 10000,
       heartbeatFrequencyMS: 10000,
     }).then(() => {
+      MONGODB_CONNECTED = true;
       console.log("Connected to MongoDB successfully");
     }).catch(err => {
+      MONGODB_CONNECTED = false;
       console.error("CRITICAL: MongoDB connection failed:", err.message);
       if (err.message.includes('ENOTFOUND')) {
         console.error("HINT: The MongoDB hostname could not be resolved. Please check your MONGODB_URI cluster name and DNS settings.");
       }
+      console.warn("WARNING: MongoDB is unavailable. Running with in-memory fallback storage in development mode.");
     });
   });
 
@@ -167,6 +297,88 @@ async function startServer() {
     res.json({ status: "ok", timestamp: new Date().toISOString() });
   });
 
+  // ML Model Prediction Proxy - Forward to FastAPI backend
+  app.post("/api/predict", async (req, res) => {
+    try {
+      const { text, algorithm } = req.body;
+      if (!text) {
+        return res.status(400).json({ error: "Text is required" });
+      }
+
+      const algo = ['logistic_regression', 'naive_bayes', 'svm'].includes(algorithm) ? algorithm : 'logistic_regression';
+
+      try {
+        const response = await fetch("http://127.0.0.1:8001/predict", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({ text, algorithm: algo })
+        });
+
+        if (!response.ok) {
+          console.warn(`FastAPI /predict unavailable (${response.status}). Using local ${algo} fallback.`);
+          return res.json({ sentiment: classifyLocalText(text, algo), fallback: true });
+        }
+
+        const data = await response.json();
+        return res.json(data);
+      } catch (innerErr: any) {
+        console.warn("FastAPI /predict request failed. Using local fallback.", innerErr.message);
+        return res.json({ sentiment: classifyLocalText(text, algo), fallback: true, details: innerErr.message });
+      }
+    } catch (err: any) {
+      console.error("Prediction proxy error:", err.message);
+      res.status(503).json({ 
+        error: "ML model service is unavailable and local fallback failed.",
+        details: err.message
+      });
+    }
+  });
+
+  // Batch ML Model Prediction Proxy - Forward to FastAPI backend (MUCH FASTER!)
+  app.post("/api/predict_batch", async (req, res) => {
+    try {
+      const { texts, algorithm } = req.body;
+      if (!texts || !Array.isArray(texts)) {
+        return res.status(400).json({ error: "Texts array is required" });
+      }
+
+      const algo = ['logistic_regression', 'naive_bayes', 'svm'].includes(algorithm) ? algorithm : 'logistic_regression';
+      console.log(`🔄 Processing batch of ${texts.length} comments with ${algo}...`);
+
+      try {
+        const response = await fetch("http://127.0.0.1:8001/predict_batch", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({ texts, algorithm: algo })
+        });
+
+        if (!response.ok) {
+          console.warn(`FastAPI batch unavailable (${response.status}). Using local ${algo} fallback.`);
+          const results = texts.map((text: string) => ({ sentiment: classifyLocalText(text, algo) }));
+          return res.json({ results, fallback: true });
+        }
+
+        const data = await response.json();
+        console.log(`✅ Batch prediction completed for ${data.results?.length || 0} comments`);
+        return res.json(data);
+      } catch (innerErr: any) {
+        console.warn("FastAPI batch request failed. Using local fallback.", innerErr.message);
+        const results = texts.map((text: string) => ({ sentiment: classifyLocalText(text, algo) }));
+        return res.json({ results, fallback: true, details: innerErr.message });
+      }
+    } catch (err: any) {
+      console.error("Batch prediction proxy error:", err.message);
+      res.status(503).json({ 
+        error: "ML model service is unavailable and local fallback failed.",
+        details: err.message
+      });
+    }
+  });
+
   app.get("/api/db-health", (req, res) => {
     const status = mongoose.connection.readyState === 1 ? "connected" : "disconnected";
     res.json({ 
@@ -185,10 +397,6 @@ async function startServer() {
     console.log("POST /api/auth/send-otp received");
     console.log("Headers:", JSON.stringify(req.headers));
     console.log("Body:", JSON.stringify(req.body));
-    if (mongoose.connection.readyState !== 1) {
-      console.error("Database not ready, state:", mongoose.connection.readyState);
-      return res.status(503).json({ error: "Database connection is not ready. Please try again in a few seconds." });
-    }
     const { email } = req.body;
     console.log("Email requested:", email);
     if (!email) return res.status(400).json({ error: "Email is required" });
@@ -197,10 +405,16 @@ async function startServer() {
     
     try {
       console.log("Cleaning up old OTPs for:", email);
-      await OTP.deleteMany({ email });
-      console.log("Saving new OTP for:", email);
-      await new OTP({ email, otp }).save();
-      console.log("OTP saved to database");
+      if (isDbReady()) {
+        await OTP.deleteMany({ email });
+        console.log("Saving new OTP for:", email);
+        await new OTP({ email, otp }).save();
+        console.log("OTP saved to database");
+      } else {
+        await deleteInMemoryOtps(email);
+        inMemoryOtps.push({ email, otp, createdAt: new Date() });
+        console.log("OTP saved to in-memory fallback store");
+      }
 
       const mailOptions = {
         from: `"Sentilytics Magic" <${process.env.SMTP_USER || 'noreply@sentilytics.magic'}>`,
@@ -258,21 +472,29 @@ async function startServer() {
   });
 
   app.post(["/api/auth/verify-otp", "/api/auth/verify-otp/"], async (req, res) => {
-    if (mongoose.connection.readyState !== 1) {
-      return res.status(503).json({ error: "Database connection is not ready." });
-    }
     const { email, otp } = req.body;
     if (!email || !otp) return res.status(400).json({ error: "Email and OTP are required" });
 
     try {
-      const validOtp = await OTP.findOne({ email, otp });
+      const validOtp = isDbReady()
+        ? await OTP.findOne({ email, otp })
+        : await findInMemoryOtp(email, otp);
       if (!validOtp) return res.status(400).json({ error: "Invalid or expired OTP" });
 
-      await OTP.deleteMany({ email });
+      if (isDbReady()) {
+        await OTP.deleteMany({ email });
+      } else {
+        await deleteInMemoryOtps(email);
+      }
 
-      let user = await User.findOne({ email });
+      let user = isDbReady()
+        ? await User.findOne({ email })
+        : await findInMemoryUserByEmail(email);
+
       if (!user) {
-        user = await new User({ email }).save();
+        user = isDbReady()
+          ? await new User({ email }).save()
+          : await createInMemoryUser(email);
       }
 
       const token = jwt.sign(
@@ -309,9 +531,13 @@ async function startServer() {
 
     try {
       const decoded = jwt.verify(token, process.env.JWT_SECRET || "magic_secret_key") as any;
-      const user = await User.findById(decoded.id);
-      if (!user) return res.status(401).json({ error: "User not found" });
-      res.json({ user });
+      if (isDbReady()) {
+        const user = await User.findById(decoded.id);
+        if (!user) return res.status(401).json({ error: "User not found" });
+        return res.json({ user });
+      }
+
+      res.json({ user: { id: decoded.id, email: decoded.email } });
     } catch (err) {
       res.status(401).json({ error: "Invalid token" });
     }
@@ -320,7 +546,9 @@ async function startServer() {
   // API Routes
   app.get("/api/history", async (req, res) => {
     try {
-      const history = await AnalysisHistory.find().sort({ created_at: -1 }).limit(20);
+      const history = isDbReady()
+        ? await AnalysisHistory.find().sort({ created_at: -1 }).limit(20)
+        : await listInMemoryAnalysisHistory();
       res.json(history);
     } catch (err) {
       res.status(500).json({ error: "Failed to fetch history" });
@@ -329,7 +557,9 @@ async function startServer() {
 
   app.get("/api/analysis/:id", async (req, res) => {
     try {
-      const analysis = await AnalysisHistory.findById(req.params.id);
+      const analysis = isDbReady()
+        ? await AnalysisHistory.findById(req.params.id)
+        : await findInMemoryAnalysisById(req.params.id);
       res.json(analysis);
     } catch (err) {
       res.status(500).json({ error: "Failed to fetch analysis" });
@@ -370,10 +600,10 @@ async function startServer() {
     const { source, target, algorithm, results, comments, suggestions } = req.body;
     
     try {
-      const newAnalysis = new AnalysisHistory({
+      const payload = {
         source,
         target,
-        algorithm: algorithm || 'gemini',
+        algorithm: algorithm || 'logistic_regression',
         positive_count: results.positive,
         neutral_count: results.neutral,
         negative_count: results.negative,
@@ -384,10 +614,17 @@ async function startServer() {
           sentiment: c.sentiment,
           author: c.author,
           likes: c.likes || 0
-        }))
-      });
-      
-      const saved = await newAnalysis.save();
+        })),
+        created_at: new Date()
+      };
+
+      if (isDbReady()) {
+        const newAnalysis = new AnalysisHistory(payload);
+        const saved = await newAnalysis.save();
+        return res.json({ id: saved._id });
+      }
+
+      const saved = await createInMemoryAnalysis(payload);
       res.json({ id: saved._id });
     } catch (err) {
       res.status(500).json({ error: "Failed to save analysis" });
@@ -404,24 +641,46 @@ async function startServer() {
     }
 
     try {
-      const response = await fetch(
-        `https://www.googleapis.com/youtube/v3/commentThreads?part=snippet&videoId=${videoId}&maxResults=50&key=${apiKey}`
-      );
-      const data = await response.json();
-      
-      if (data.error) {
-        return res.status(400).json({ error: data.error.message });
+      const comments: any[] = [];
+      let nextPageToken: string | undefined = undefined;
+      const maxComments = 200;
+      const pageSize = 50;
+
+      while (comments.length < maxComments) {
+        const url = new URL('https://www.googleapis.com/youtube/v3/commentThreads');
+        url.searchParams.set('part', 'snippet');
+        url.searchParams.set('videoId', String(videoId));
+        url.searchParams.set('maxResults', String(pageSize));
+        url.searchParams.set('key', apiKey);
+        if (nextPageToken) {
+          url.searchParams.set('pageToken', nextPageToken);
+        }
+
+        const response = await fetch(url.toString());
+        const data = await response.json();
+
+        if (data.error) {
+          return res.status(400).json({ error: data.error.message });
+        }
+
+        const pageComments = (data.items || []).map((item: any) => ({
+          text: item.snippet.topLevelComment.snippet.textDisplay,
+          author: item.snippet.topLevelComment.snippet.authorDisplayName,
+          likes: item.snippet.topLevelComment.snippet.likeCount,
+          publishedAt: item.snippet.topLevelComment.snippet.publishedAt,
+        }));
+
+        comments.push(...pageComments);
+        nextPageToken = data.nextPageToken;
+
+        if (!nextPageToken || comments.length >= maxComments) {
+          break;
+        }
       }
 
-      const comments = data.items.map((item: any) => ({
-        text: item.snippet.topLevelComment.snippet.textDisplay,
-        author: item.snippet.topLevelComment.snippet.authorDisplayName,
-        likes: item.snippet.topLevelComment.snippet.likeCount,
-        publishedAt: item.snippet.topLevelComment.snippet.publishedAt,
-      }));
-
-      res.json(comments);
+      res.json(comments.slice(0, maxComments));
     } catch (error) {
+      console.error('YouTube comments fetch error:', error);
       res.status(500).json({ error: "Failed to fetch YouTube comments" });
     }
   });
@@ -453,7 +712,12 @@ async function startServer() {
   if (process.env.NODE_ENV !== "production") {
     console.log("Initializing Vite dev server...");
     createViteServer({
-      server: { middlewareMode: true },
+      server: {
+        middlewareMode: true,
+        hmr: {
+          port: process.env.HMR_PORT ? parseInt(process.env.HMR_PORT, 10) : 24680,
+        }
+      },
       appType: "spa",
     }).then(vite => {
       app.use(vite.middlewares);
