@@ -4,6 +4,7 @@ import mongoose from "mongoose";
 import dotenv from "dotenv";
 import path from "path";
 import { fileURLToPath } from "url";
+import fs from "fs";
 import natural from "natural";
 import nodemailer from "nodemailer";
 import jwt from "jsonwebtoken";
@@ -130,6 +131,10 @@ const createInMemoryUser = async (email: string) => {
 const createInMemoryAnalysis = async (data: any) => {
   const record = { _id: generateId(), ...data };
   inMemoryAnalysisHistory.unshift(record);
+  // Keep only the latest 2 analyses (current + 1 previous)
+  if (inMemoryAnalysisHistory.length > 2) {
+    inMemoryAnalysisHistory.length = 2;
+  }
   return record;
 };
 
@@ -138,7 +143,7 @@ const findInMemoryAnalysisById = async (id: string) => {
 };
 
 const listInMemoryAnalysisHistory = async () => {
-  return inMemoryAnalysisHistory.slice(0, 20);
+  return inMemoryAnalysisHistory.slice(0, 2);
 };
 
 // Mail Transporter
@@ -152,21 +157,126 @@ const transporter = nodemailer.createTransport({
   },
 });
 
-// Initialize Naive Bayes Classifier with some training data
+const positiveSentimentLabels = new Set([
+  'positive', 'joy', 'excitement', 'contentment', 'gratitude', 'serenity', 'happy',
+  'nostalgia', 'awe', 'hopeful', 'acceptance', 'pride', 'elation', 'euphoria',
+  'enthusiasm', 'determination', 'playful', 'inspiration', 'happiness', 'hope',
+  'empowerment', 'inspired', 'admiration', 'calmness', 'compassion', 'tenderness',
+  'arousal', 'fulfillment', 'reverence', 'proud', 'grateful', 'compassionate',
+  'thrill', 'reflection', 'enchantment', 'love', 'amusement', 'anticipation',
+  'kind', 'empathetic', 'free-spirited', 'confident', 'satisfaction',
+  'accomplishment', 'harmony', 'creativity', 'wonder', 'adventure', 'enjoyment',
+  'affection', 'adoration', 'zest', 'overjoyed', 'motivation', 'blessed',
+  'appreciation', 'confidence', 'wonderment', 'optimism', 'playfuljoy',
+  'mindfulness', 'freedom', 'dazzle', 'adrenaline', 'spark', 'marvel',
+  'positivity', 'kindness', 'friendship', 'success', 'amazement', 'romance',
+  'grandeur', 'energy', 'celebration', 'charm', 'ecstasy', 'connection',
+  'iconic', 'engagement', 'touched', 'triumph', 'heartwarming', 'breakthrough',
+  'relief', 'vibrancy'
+]);
+
+const negativeSentimentLabels = new Set([
+  'negative', 'despair', 'grief', 'loneliness', 'sad', 'confusion', 'embarrassed',
+  'frustration', 'regret', 'hate', 'bad', 'disgust', 'bitterness', 'frustrated',
+  'betrayal', 'boredom', 'overwhelmed', 'desolation', 'bitter', 'shame',
+  'jealousy', 'resentment', 'fearful', 'jealous', 'devastated', 'envious',
+  'dismissive', 'heartbreak', 'anger', 'fear', 'sadness', 'disappointed',
+  'anxiety', 'intimidation', 'helplessness', 'envy', 'apprehensive', 'isolation',
+  'disappointment', 'sorrow', 'loss', 'suffering', 'exhaustion', 'darkness',
+  'desperation', 'ruins', 'heartache', 'pressure', 'miscalculation', 'challenge'
+]);
+
+const neutralSentimentLabels = new Set([
+  'neutral', 'curiosity', 'indifference', 'numbness', 'ambivalence', 'surprise',
+  'bittersweet', 'contemplation', 'pensive', 'intrigue', 'suspense', 'solace'
+]);
+
+const normalizeSentimentLabel = (label: string) => {
+  const normalized = label.toLowerCase().trim();
+  if (positiveSentimentLabels.has(normalized)) return 'positive';
+  if (negativeSentimentLabels.has(normalized)) return 'negative';
+  if (neutralSentimentLabels.has(normalized)) return 'neutral';
+  return 'neutral';
+};
+
+const parseCsvLine = (line: string) => {
+  const values: string[] = [];
+  let current = '';
+  let inQuotes = false;
+
+  for (let i = 0; i < line.length; i++) {
+    const char = line[i];
+    const next = line[i + 1];
+
+    if (char === '"' && inQuotes && next === '"') {
+      current += '"';
+      i++;
+    } else if (char === '"') {
+      inQuotes = !inQuotes;
+    } else if (char === ',' && !inQuotes) {
+      values.push(current);
+      current = '';
+    } else {
+      current += char;
+    }
+  }
+
+  values.push(current);
+  return values;
+};
+
+const trainNaiveBayesFromDataset = () => {
+  const datasetPath = path.join(__dirname, "sentimentdataset.csv");
+
+  if (!fs.existsSync(datasetPath)) {
+    console.warn("sentimentdataset.csv not found; using minimal Naive Bayes seed data.");
+    return 0;
+  }
+
+  const csv = fs.readFileSync(datasetPath, "utf8").replace(/^\uFEFF/, "");
+  const lines = csv.split(/\r?\n/).filter(Boolean);
+  const headers = parseCsvLine(lines[0]).map((header) => header.trim());
+  const textIndex = headers.indexOf("Text");
+  const sentimentIndex = headers.indexOf("Sentiment");
+
+  if (textIndex === -1 || sentimentIndex === -1) {
+    console.warn("sentimentdataset.csv is missing Text or Sentiment columns; using minimal Naive Bayes seed data.");
+    return 0;
+  }
+
+  let trainedRows = 0;
+  for (const line of lines.slice(1)) {
+    const row = parseCsvLine(line);
+    const text = (row[textIndex] || "").trim();
+    const sentiment = normalizeSentimentLabel(row[sentimentIndex] || "");
+    if (text && sentiment) {
+      classifier.addDocument(text.toLowerCase(), sentiment);
+      trainedRows++;
+    }
+  }
+
+  return trainedRows;
+};
+
+// Initialize Naive Bayes Classifier with dataset-backed training data.
 const classifier = new natural.BayesClassifier();
 
-// Simple training set
-classifier.addDocument('i love this so much amazing great', 'positive');
-classifier.addDocument('best thing ever wonderful', 'positive');
-classifier.addDocument('happy good excellent', 'positive');
-classifier.addDocument('hate this terrible worst', 'negative');
-classifier.addDocument('bad awful boring', 'negative');
-classifier.addDocument('disappointed annoying', 'negative');
-classifier.addDocument('it is okay fine normal', 'neutral');
-classifier.addDocument('maybe average standard', 'neutral');
-classifier.addDocument('the video is about a cat', 'neutral');
+const naiveBayesRows = trainNaiveBayesFromDataset();
+
+if (naiveBayesRows === 0) {
+  classifier.addDocument('i love this so much amazing great', 'positive');
+  classifier.addDocument('best thing ever wonderful', 'positive');
+  classifier.addDocument('happy good excellent', 'positive');
+  classifier.addDocument('hate this terrible worst', 'negative');
+  classifier.addDocument('bad awful boring', 'negative');
+  classifier.addDocument('disappointed annoying', 'negative');
+  classifier.addDocument('it is okay fine normal', 'neutral');
+  classifier.addDocument('maybe average standard', 'neutral');
+  classifier.addDocument('the video is about a cat', 'neutral');
+}
 
 classifier.train();
+console.log(`Naive Bayes classifier trained with ${naiveBayesRows || 9} examples.`);
 
 const logisticWeights: Record<string, number> = {
   love: 2.5,
@@ -547,7 +657,7 @@ async function startServer() {
   app.get("/api/history", async (req, res) => {
     try {
       const history = isDbReady()
-        ? await AnalysisHistory.find().sort({ created_at: -1 }).limit(20)
+        ? await AnalysisHistory.find().sort({ created_at: -1 }).limit(2)
         : await listInMemoryAnalysisHistory();
       res.json(history);
     } catch (err) {
@@ -619,6 +729,13 @@ async function startServer() {
       };
 
       if (isDbReady()) {
+        // Delete all but keep the latest 2 (current will be new, so delete all before keeping just 1)
+        const allAnalyses = await AnalysisHistory.find().sort({ created_at: -1 });
+        if (allAnalyses.length > 1) {
+          const toDelete = allAnalyses.slice(1).map(a => a._id);
+          await AnalysisHistory.deleteMany({ _id: { $in: toDelete } });
+        }
+        
         const newAnalysis = new AnalysisHistory(payload);
         const saved = await newAnalysis.save();
         return res.json({ id: saved._id });
@@ -682,6 +799,92 @@ async function startServer() {
     } catch (error) {
       console.error('YouTube comments fetch error:', error);
       res.status(500).json({ error: "Failed to fetch YouTube comments" });
+    }
+  });
+
+  // Generate AI Insights from ML Analysis
+  app.post("/api/generate-insights", async (req, res) => {
+    try {
+      const { positive_count, neutral_count, negative_count, total_count, comments } = req.body;
+      console.log("📊 Generating insights - Total comments:", total_count, "Pos:", positive_count, "Neu:", neutral_count, "Neg:", negative_count);
+      
+      if (!total_count || total_count === 0) {
+        return res.json({ insights: "No data to analyze for insights." });
+      }
+
+      const positivePercent = Math.round((positive_count / total_count) * 100);
+      const neutralPercent = Math.round((neutral_count / total_count) * 100);
+      const negativePercent = Math.round((negative_count / total_count) * 100);
+
+      // Extract top themes from positive and negative comments
+      const positiveComments = (comments || []).filter((c: any) => c.sentiment === 'positive').map((c: any) => c.text.toLowerCase());
+      const negativeComments = (comments || []).filter((c: any) => c.sentiment === 'negative').map((c: any) => c.text.toLowerCase());
+
+      console.log("💬 Positive comments:", positiveComments.length, "Negative comments:", negativeComments.length);
+
+      // Simple keyword extraction
+      const getTopWords = (texts: string[], count: number = 3): string[] => {
+        const wordFreq: { [key: string]: number } = {};
+        const stopWords = new Set(['the', 'a', 'an', 'and', 'or', 'is', 'it', 'that', 'this', 'of', 'to', 'in', 'for', 'with', 'by', 'on', 'at', 'from', 'as', 'be', 'was', 'are', 'been', 'being', 'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could', 'should', 'may', 'might', 'must', 'can']);
+        
+        texts.forEach(text => {
+          text.match(/\b\w+\b/g)?.forEach(word => {
+            if (word.length > 3 && !stopWords.has(word)) {
+              wordFreq[word] = (wordFreq[word] || 0) + 1;
+            }
+          });
+        });
+
+        return Object.entries(wordFreq)
+          .sort((a, b) => b[1] - a[1])
+          .slice(0, count)
+          .map(([word]) => word);
+      };
+
+      const topPositiveWords = getTopWords(positiveComments, 3);
+      const topNegativeWords = getTopWords(negativeComments, 3);
+
+      // Generate insights
+      let insights = `## Analysis Summary\n\n`;
+      insights += `**Overall Sentiment Distribution:**\n`;
+      insights += `- 😊 Positive: ${positivePercent}% (${positive_count} comments)\n`;
+      insights += `- 😐 Neutral: ${neutralPercent}% (${neutral_count} comments)\n`;
+      insights += `- 😞 Negative: ${negativePercent}% (${negative_count} comments)\n\n`;
+
+      // Sentiment trend
+      if (positivePercent > 50) {
+        insights += `🟢 **Positive Trend:** The majority of feedback is positive, indicating strong satisfaction and engagement.\n\n`;
+      } else if (negativePercent > 50) {
+        insights += `🔴 **Negative Trend:** More than half of the feedback is negative. Consider addressing the main concerns.\n\n`;
+      } else if (neutralPercent > 50) {
+        insights += `🟡 **Neutral Trend:** Most responses are neutral. Engagement is moderate with mixed reactions.\n\n`;
+      }
+
+      // Key themes
+      if (topPositiveWords.length > 0) {
+        insights += `**Positive Themes:** ${topPositiveWords.join(', ')}\n`;
+      }
+      if (topNegativeWords.length > 0) {
+        insights += `**Negative Themes:** ${topNegativeWords.join(', ')}\n\n`;
+      }
+
+      // Recommendations
+      insights += `**Recommendations:**\n`;
+      if (positivePercent > 60) {
+        insights += `- Continue what you're doing - maintain current strategies that resonate with your audience\n`;
+      } else if (negativePercent > 40) {
+        insights += `- Address key concerns identified in negative feedback\n`;
+        insights += `- Implement improvements based on common complaints\n`;
+      }
+      if (neutralPercent > 40) {
+        insights += `- Work on engaging neutral audience members with stronger value propositions\n`;
+      }
+
+      console.log("✅ Insights generated successfully");
+      res.json({ insights });
+    } catch (err) {
+      console.error("❌ Generate insights error:", err);
+      res.status(500).json({ error: "Failed to generate insights", details: (err as any).message });
     }
   });
 

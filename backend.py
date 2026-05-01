@@ -20,6 +20,9 @@ app.add_middleware(
 model = None
 vectorizer = None
 model_loaded = False
+nb_model = None
+nb_vectorizer = None
+nb_model_loaded = False
 
 transformer_model = None
 use_transformer = False
@@ -31,6 +34,8 @@ use_vader = False
 BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_PATH = os.path.join(BACKEND_DIR, "model.pkl")
 VECTORIZER_PATH = os.path.join(BACKEND_DIR, "vectorizer.pkl")
+NB_MODEL_PATH = os.path.join(BACKEND_DIR, "naive_bayes_model.pkl")
+NB_VECTORIZER_PATH = os.path.join(BACKEND_DIR, "naive_bayes_vectorizer.pkl")
 
 # Try loading custom model
 try:
@@ -46,6 +51,20 @@ try:
         print(f"  Looking for files in: {BACKEND_DIR}")
 except Exception as e:
     print(f"✗ Error loading custom model: {e}")
+
+# Try loading Naive Bayes model
+try:
+    if os.path.exists(NB_MODEL_PATH) and os.path.exists(NB_VECTORIZER_PATH):
+        with open(NB_MODEL_PATH, "rb") as f:
+            nb_model = pickle.load(f)
+        with open(NB_VECTORIZER_PATH, "rb") as f:
+            nb_vectorizer = pickle.load(f)
+        nb_model_loaded = True
+        print("Naive Bayes model and vectorizer loaded successfully")
+    else:
+        print("Warning: naive_bayes_model.pkl or naive_bayes_vectorizer.pkl not found")
+except Exception as e:
+    print(f"Error loading Naive Bayes model: {e}")
 
 # Load transformer as fallback for better accuracy
 try:
@@ -70,20 +89,71 @@ except Exception as e:
 
 class InputText(BaseModel):
     text: str
+    algorithm: str | None = None
+
+POSITIVE_LABELS = {
+    "positive", "joy", "excitement", "contentment", "gratitude", "serenity", "happy",
+    "nostalgia", "awe", "hopeful", "acceptance", "pride", "elation", "euphoria",
+    "enthusiasm", "determination", "playful", "inspiration", "happiness", "hope",
+    "empowerment", "inspired", "admiration", "calmness", "compassion", "tenderness",
+    "arousal", "fulfillment", "reverence", "proud", "grateful", "compassionate",
+    "thrill", "reflection", "enchantment", "love", "amusement", "anticipation",
+    "kind", "empathetic", "free-spirited", "confident", "satisfaction",
+    "accomplishment", "harmony", "creativity", "wonder", "adventure", "enjoyment",
+    "affection", "adoration", "zest", "overjoyed", "motivation", "blessed",
+    "appreciation", "confidence", "wonderment", "optimism", "playfuljoy",
+    "mindfulness", "freedom", "dazzle", "adrenaline", "spark", "marvel",
+    "positivity", "kindness", "friendship", "success", "amazement", "romance",
+    "grandeur", "energy", "celebration", "charm", "ecstasy", "connection",
+    "iconic", "engagement", "touched", "triumph", "heartwarming", "breakthrough",
+    "relief", "vibrancy"
+}
+
+NEGATIVE_LABELS = {
+    "negative", "despair", "grief", "loneliness", "sad", "confusion", "embarrassed",
+    "frustration", "regret", "hate", "bad", "disgust", "bitterness", "frustrated",
+    "betrayal", "boredom", "overwhelmed", "desolation", "bitter", "shame",
+    "jealousy", "resentment", "fearful", "jealous", "devastated", "envious",
+    "dismissive", "heartbreak", "anger", "fear", "sadness", "disappointed",
+    "anxiety", "intimidation", "helplessness", "envy", "apprehensive", "isolation",
+    "disappointment", "sorrow", "loss", "suffering", "exhaustion", "darkness",
+    "desperation", "ruins", "heartache", "pressure", "miscalculation", "challenge"
+}
+
+NEUTRAL_LABELS = {
+    "neutral", "curiosity", "indifference", "numbness", "ambivalence", "surprise",
+    "bittersweet", "contemplation", "pensive", "intrigue", "suspense", "solace"
+}
 
 def normalize_sentiment(sentiment_label: str) -> str:
-    """Normalize sentiment labels to positive/negative/neutral"""
+    """Normalize fine-grained emotion labels to positive/negative/neutral."""
     label = sentiment_label.lower().strip()
-    if "positive" in label or "good" in label or "great" in label:
+    if label in POSITIVE_LABELS:
         return "positive"
-    elif "negative" in label or "bad" in label:
+    if label in NEGATIVE_LABELS:
         return "negative"
-    else:
+    if label in NEUTRAL_LABELS:
         return "neutral"
+    return "neutral"
+
+def predict_with_model(text: str, selected_model, selected_vectorizer, model_name: str):
+    vec = selected_vectorizer.transform([text])
+    result = selected_model.predict(vec)[0]
+    proba = selected_model.predict_proba(vec)[0]
+    confidence = float(max(proba))
+    final_sentiment = normalize_sentiment(result)
+    print(f"{model_name} prediction: {final_sentiment} ({confidence:.2%})")
+    return {
+        "input": text,
+        "sentiment": final_sentiment,
+        "confidence": confidence,
+        "model_used": model_name
+    }
 
 @app.post("/predict")
 def predict(data: InputText):
     text = data.text.strip()
+    algorithm = (data.algorithm or "logistic_regression").lower()
     
     if not text:
         return {
@@ -92,8 +162,34 @@ def predict(data: InputText):
             "confidence": 0.0,
             "model_used": "none"
         }
+
+    algo = algorithm if algorithm in ["logistic_regression", "naive_bayes", "svm"] else "logistic_regression"
     
-    # Try transformer first (better accuracy on diverse text)
+    # If user requests logistic regression, use the custom model first
+    if algo == "logistic_regression" and model_loaded and vectorizer:
+        try:
+            vec = vectorizer.transform([text])
+            result = model.predict(vec)[0]
+            proba = model.predict_proba(vec)[0]
+            confidence = float(max(proba))
+            final_sentiment = normalize_sentiment(result)
+            print(f"📊 Custom logistic regression prediction: {final_sentiment} ({confidence:.2%})")
+            return {
+                "input": text,
+                "sentiment": final_sentiment,
+                "confidence": confidence,
+                "model_used": "custom"
+            }
+        except Exception as e:
+            print(f"✗ Custom logistic regression error: {e}")
+
+    if algo == "naive_bayes" and nb_model_loaded and nb_vectorizer:
+        try:
+            return predict_with_model(text, nb_model, nb_vectorizer, "naive_bayes")
+        except Exception as e:
+            print(f"Naive Bayes error: {e}")
+
+    # Try transformer first for non-custom algorithms or when custom model fails
     if use_transformer:
         try:
             # Handle text length (transformers have limits)
@@ -102,13 +198,27 @@ def predict(data: InputText):
             sentiment = result[0]['label'].lower()
             confidence = float(result[0]['score'])
             
-            # Map POSITIVE/NEGATIVE to our labels
-            if sentiment == 'positive':
+            # Lower confidence threshold to catch more sentiment
+            if sentiment == 'positive' and confidence >= 0.5:
                 final_sentiment = 'positive'
-            elif sentiment == 'negative':
+            elif sentiment == 'negative' and confidence >= 0.5:
                 final_sentiment = 'negative'
             else:
-                final_sentiment = 'neutral'
+                # Use Vader for borderline cases
+                if use_vader:
+                    try:
+                        scores = vader_analyzer.polarity_scores(truncated_text)
+                        compound = float(scores["compound"])
+                        if compound >= 0.1:
+                            final_sentiment = 'positive'
+                        elif compound <= -0.1:
+                            final_sentiment = 'negative'
+                        else:
+                            final_sentiment = 'neutral'
+                    except:
+                        final_sentiment = 'neutral'
+                else:
+                    final_sentiment = 'neutral'
             
             print(f"📊 Transformer prediction: {final_sentiment} ({confidence:.2%})")
             return {
@@ -126,9 +236,10 @@ def predict(data: InputText):
             scores = vader_analyzer.polarity_scores(text)
             compound = float(scores["compound"])
             final_sentiment = "neutral"
-            if compound >= 0.4:
+            # More aggressive sentiment thresholds to reduce neutral classification
+            if compound >= 0.1:
                 final_sentiment = "positive"
-            elif compound <= -0.4:
+            elif compound <= -0.1:
                 final_sentiment = "negative"
             
             print(f"📊 Vader prediction: {final_sentiment} ({compound:.2f})")
@@ -184,11 +295,14 @@ def predict(data: InputText):
 
 class BatchInput(BaseModel):
     texts: list[str]
+    algorithm: str | None = None
 
 @app.post("/predict_batch")
 def predict_batch(data: BatchInput):
     """Batch prediction for multiple texts - much faster than individual calls"""
     results = []
+    algorithm = (data.algorithm or "logistic_regression").lower()
+    algo = algorithm if algorithm in ["logistic_regression", "naive_bayes", "svm"] else "logistic_regression"
     
     for text in data.texts:
         text = text.strip()
@@ -201,6 +315,22 @@ def predict_batch(data: BatchInput):
                 "model_used": "none"
             })
             continue
+
+        if algo == "logistic_regression" and model_loaded and vectorizer:
+            try:
+                prediction = predict_with_model(text, model, vectorizer, "logistic_regression")
+                results.append({**prediction, "text": text})
+                continue
+            except Exception as e:
+                print(f"Custom logistic regression error for batch item: {e}")
+
+        if algo == "naive_bayes" and nb_model_loaded and nb_vectorizer:
+            try:
+                prediction = predict_with_model(text, nb_model, nb_vectorizer, "naive_bayes")
+                results.append({**prediction, "text": text})
+                continue
+            except Exception as e:
+                print(f"Naive Bayes error for batch item: {e}")
         
         # Try transformer first (better accuracy on diverse text)
         if use_transformer:
@@ -235,9 +365,9 @@ def predict_batch(data: BatchInput):
                 scores = vader_analyzer.polarity_scores(text)
                 compound = float(scores["compound"])
                 final_sentiment = "neutral"
-                if compound >= 0.4:
+                if compound >= 0.1:
                     final_sentiment = "positive"
-                elif compound <= -0.4:
+                elif compound <= -0.1:
                     final_sentiment = "negative"
                 
                 results.append({

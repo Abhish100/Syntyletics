@@ -17,7 +17,10 @@ import {
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import Markdown from 'react-markdown';
+// @ts-ignore
 import Papa from 'papaparse';
+// @ts-ignore
+import type { ParseResult } from 'papaparse';
 import { format } from 'date-fns';
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
@@ -368,7 +371,7 @@ export default function App() {
           Papa.parse(content, {
             header: false,
             skipEmptyLines: true,
-            complete: (results) => {
+            complete: (results: ParseResult<any>) => {
               const data = results.data.slice(1).map((row: any) => ({
                 text: row[0] || "",
                 author: row[1] || "Anonymous",
@@ -538,12 +541,39 @@ export default function App() {
 
       const analyzed = await analyzeSentiment(comments);
       
-      const counts = analyzed.reduce((acc, curr) => {
-        acc[curr.sentiment || 'neutral']++;
-        return acc;
-      }, { positive: 0, neutral: 0, negative: 0 });
+      const counts: { positive: number; neutral: number; negative: number } = { positive: 0, neutral: 0, negative: 0 };
+      for (const curr of analyzed) {
+        const sentiment = curr.sentiment || 'neutral';
+        if (sentiment in counts) {
+          counts[sentiment as keyof typeof counts]++;
+        }
+      }
 
-      const suggestions = "Sentiment analysis is complete. Review the model results and use the counts to identify positive, neutral, and negative trends in your text data.";
+      // Generate insights using ML-based analysis
+      let suggestions = "Sentiment analysis is complete. Review the model results and use the counts to identify positive, neutral, and negative trends in your text data.";
+      try {
+        const insightsRes = await fetch(`${window.location.origin}/api/generate-insights`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            positive_count: counts.positive,
+            neutral_count: counts.neutral,
+            negative_count: counts.negative,
+            total_count: analyzed.length,
+            comments: analyzed
+          })
+        });
+        
+        const insightsText = await insightsRes.text();
+        try {
+          const insightsData = JSON.parse(insightsText);
+          suggestions = insightsData.insights || suggestions;
+        } catch (e) {
+          console.error("Generate insights: invalid JSON", insightsText);
+        }
+      } catch (insightsErr) {
+        console.error("Failed to generate insights", insightsErr);
+      }
 
       const analysisData = {
         source,
@@ -923,7 +953,6 @@ export default function App() {
                 >
                   <option value="logistic_regression" className="bg-magic-blue">Logistic Regression (ML)</option>
                   <option value="naive_bayes" className="bg-magic-blue">Naive Bayes (ML)</option>
-                  <option value="svm" className="bg-magic-blue">Support Vector Machine (SVM)</option>
                 </select>
 
                 <AnimatePresence mode="wait">
