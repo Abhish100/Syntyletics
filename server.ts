@@ -18,9 +18,7 @@ const __dirname = path.dirname(__filename);
 
 // MongoDB Connection
 // Using the explicitly provided URI from the user
-const rawUri = process.env.MONGODB_URI && !process.env.MONGODB_URI.includes('cluster0.qv0oqyy') 
-  ? process.env.MONGODB_URI 
-  : "mongodb+srv://as9423320_db_user:YVTzl9wyH886qlGq@sentilytics.0tu8yne.mongodb.net/?appName=Sentilytics";
+const rawUri = process.env.MONGODB_URI || "";
 
 // Robust URI handling for passwords containing '@'
 let MONGODB_URI = rawUri;
@@ -156,6 +154,54 @@ const transporter = nodemailer.createTransport({
     pass: process.env.SMTP_PASS,
   },
 });
+
+const sendOtpEmail = async (email: string, otp: string, html: string, text: string) => {
+  if (process.env.RESEND_API_KEY) {
+    const response = await fetch("https://api.resend.com/emails", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${process.env.RESEND_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        from: process.env.RESEND_FROM_EMAIL || "Sentilytics <onboarding@resend.dev>",
+        to: email,
+        subject: "Your Sentilytics Access Code",
+        html,
+        text,
+      }),
+    });
+
+    if (!response.ok) {
+      const details = await response.text();
+      throw new Error(`Resend email failed (${response.status}): ${details}`);
+    }
+
+    return;
+  }
+
+  if (!process.env.SMTP_USER || !process.env.SMTP_PASS) {
+    throw new Error("No email provider configured. Set RESEND_API_KEY or SMTP_USER/SMTP_PASS.");
+  }
+
+  const currentTransporter = nodemailer.createTransport({
+    host: process.env.SMTP_HOST || "smtp.gmail.com",
+    port: parseInt(process.env.SMTP_PORT || "587"),
+    secure: false,
+    auth: {
+      user: process.env.SMTP_USER,
+      pass: process.env.SMTP_PASS,
+    },
+  });
+
+  await currentTransporter.sendMail({
+    from: `"Sentilytics Magic" <${process.env.SMTP_USER}>`,
+    to: email,
+    subject: "Your Sentilytics Access Code",
+    text,
+    html,
+  });
+};
 
 const positiveSentimentLabels = new Set([
   'positive', 'joy', 'excitement', 'contentment', 'gratitude', 'serenity', 'happy',
@@ -364,29 +410,34 @@ async function startServer() {
   const app = express();
   const DEFAULT_PORT = 3000;
   const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : DEFAULT_PORT;
+  const HOST = process.env.NODE_ENV === "production" ? "0.0.0.0" : "127.0.0.1";
   
   // Start listening IMMEDIATELY to satisfy the proxy health checks
-  const server = app.listen(PORT, "127.0.0.1", () => {
-    console.log(`Server listening on http://127.0.0.1:${PORT}`);
+  const server = app.listen(PORT, HOST, () => {
+    console.log(`Server listening on http://${HOST}:${PORT}`);
     console.log(`Mode: ${process.env.NODE_ENV || 'development'}`);
     
     // Connect to MongoDB in the background
-    console.log("Connecting to MongoDB...");
-    mongoose.connect(MONGODB_URI, {
-      serverSelectionTimeoutMS: 10000,
-      connectTimeoutMS: 10000,
-      heartbeatFrequencyMS: 10000,
-    }).then(() => {
-      MONGODB_CONNECTED = true;
-      console.log("Connected to MongoDB successfully");
-    }).catch(err => {
-      MONGODB_CONNECTED = false;
-      console.error("CRITICAL: MongoDB connection failed:", err.message);
-      if (err.message.includes('ENOTFOUND')) {
-        console.error("HINT: The MongoDB hostname could not be resolved. Please check your MONGODB_URI cluster name and DNS settings.");
-      }
-      console.warn("WARNING: MongoDB is unavailable. Running with in-memory fallback storage in development mode.");
-    });
+    if (!MONGODB_URI) {
+      console.warn("MONGODB_URI is not configured. Running with in-memory fallback storage.");
+    } else {
+      console.log("Connecting to MongoDB...");
+      mongoose.connect(MONGODB_URI, {
+        serverSelectionTimeoutMS: 10000,
+        connectTimeoutMS: 10000,
+        heartbeatFrequencyMS: 10000,
+      }).then(() => {
+        MONGODB_CONNECTED = true;
+        console.log("Connected to MongoDB successfully");
+      }).catch(err => {
+        MONGODB_CONNECTED = false;
+        console.error("CRITICAL: MongoDB connection failed:", err.message);
+        if (err.message.includes('ENOTFOUND')) {
+          console.error("HINT: The MongoDB hostname could not be resolved. Please check your MONGODB_URI cluster name and DNS settings.");
+        }
+        console.warn("WARNING: MongoDB is unavailable. Running with in-memory fallback storage.");
+      });
+    }
   });
 
   app.use(cors({
@@ -526,49 +577,32 @@ async function startServer() {
         console.log("OTP saved to in-memory fallback store");
       }
 
-      const mailOptions = {
-        from: `"Sentilytics Magic" <${process.env.SMTP_USER || 'noreply@sentilytics.magic'}>`,
-        to: email,
-        subject: "Your Magic Access Code",
-        text: `Your magic access code is: ${otp}. It will expire in 10 minutes.`,
-        html: `<div style="font-family: serif; padding: 20px; background: #0a0a0a; color: white; border-radius: 12px;">
+      const otpText = `Your Sentilytics access code is: ${otp}. It will expire in 10 minutes.`;
+      const otpHtml = `<div style="font-family: serif; padding: 20px; background: #0a0a0a; color: white; border-radius: 12px;">
                 <h2 style="color: #f59e0b;">Sentilytics Magic</h2>
                 <p>Your magic access code is:</p>
                 <div style="font-size: 32px; font-weight: bold; letter-spacing: 4px; color: #f59e0b; margin: 20px 0;">${otp}</div>
                 <p style="font-size: 12px; color: #666;">This code will expire in 10 minutes. If you didn't request this, ignore this scroll.</p>
-              </div>`,
-      };
+              </div>`;
 
-      if (process.env.SMTP_USER && process.env.SMTP_PASS) {
-        try {
-          // Re-initialize transporter to ensure latest env vars are used
-          const currentTransporter = nodemailer.createTransport({
-            host: process.env.SMTP_HOST || "smtp.gmail.com",
-            port: parseInt(process.env.SMTP_PORT || "587"),
-            secure: false,
-            auth: {
-              user: process.env.SMTP_USER,
-              pass: process.env.SMTP_PASS,
-            },
-          });
-          
-          await currentTransporter.sendMail(mailOptions);
-          res.json({ message: "OTP sent to your email" });
-        } catch (mailErr: any) {
-          console.error("SMTP Error, falling back to dev mode:", mailErr.message);
-          res.json({ 
-            message: "Email failed, falling back to Dev Mode", 
-            dev: true,
-            otp: otp,
-            smtpError: mailErr.message
+      try {
+        await sendOtpEmail(email, otp, otpHtml, otpText);
+        return res.json({ message: "OTP sent to your email" });
+      } catch (mailErr: any) {
+        console.error("Email delivery failed:", mailErr.message);
+        if (process.env.NODE_ENV === "production") {
+          return res.status(500).json({
+            error: "Email delivery failed",
+            hint: "Check RESEND_API_KEY, RESEND_FROM_EMAIL, or SMTP settings.",
           });
         }
-      } else {
+
         console.log("--- DEV MODE: OTP for", email, "is", otp, "---");
-        res.json({ 
-          message: "OTP generated (Check server logs in dev mode)", 
+        return res.json({
+          message: "Email failed, falling back to Dev Mode",
           dev: true,
-          otp: otp // Include OTP in response for easier dev access
+          otp,
+          emailError: mailErr.message,
         });
       }
     } catch (err: any) {
