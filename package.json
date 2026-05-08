@@ -6,14 +6,14 @@
   "engines": {
     "node": "22.x"
   },
-  "scripts": {
-    "dev": "tsx server.ts",
-    "start": "tsx server.ts",
-    "build": "vite build",
-    "preview": "vite preview",
-    "clean": "rm -rf dist",
-    "lint": "tsc --noEmit"
-  },
+ "scripts": {
+  "dev": "tsx server.ts",
+  "build": "vite build && tsc server.ts --outDir dist-server --module NodeNext --target ES2022",
+  "start": "node dist-server/server.js",
+  "preview": "vite preview",
+  "clean": "rm -rf dist",
+  "lint": "tsc --noEmit"
+}
   "dependencies": {
     "@google/genai": "^1.29.0",
     "@tailwindcss/typography": "^0.5.19",
