@@ -186,7 +186,7 @@ const sendOtpEmail = async (email: string, otp: string, html: string, text: stri
 
   const currentTransporter = nodemailer.createTransport({
     host: process.env.SMTP_HOST || "smtp.gmail.com",
-    port: parseInt(process.env.SMTP_PORT || "587"),
+    port: parseInt(process.env.SMTP_PORT || "487"),
     secure: false,
     auth: {
       user: process.env.SMTP_USER,
