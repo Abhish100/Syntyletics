@@ -194,7 +194,18 @@ const sendOtpEmail = async (email: string, otp: string, html: string, text: stri
     },
   });
 
-  await currentTransporter.sendMail({
+ console.log("SMTP CONFIG:", {
+  host: process.env.SMTP_HOST,
+  port: process.env.SMTP_PORT,
+  user: process.env.SMTP_USER,
+  hasPass: !!process.env.SMTP_PASS,
+});
+
+await currentTransporter.verify();
+
+console.log("SMTP VERIFIED");
+
+await currentTransporter.sendMail({
     from: `"Sentilytics Magic" <${process.env.SMTP_USER}>`,
     to: email,
     subject: "Your Sentilytics Access Code",
