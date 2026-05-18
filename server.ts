@@ -103,6 +103,13 @@ const inMemoryOtps: Array<{ email: string; otp: string; createdAt: Date }> = [];
 
 const isDbReady = () => mongoose.connection.readyState === 1 && MONGODB_CONNECTED;
 const generateId = () => `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+const normalizeEmail = (email: string) => email.trim().toLowerCase();
+const fallbackLoginEmail = process.env.FALLBACK_LOGIN_EMAIL
+  ? normalizeEmail(process.env.FALLBACK_LOGIN_EMAIL)
+  : "";
+const fallbackLoginOtp = process.env.FALLBACK_LOGIN_OTP || "";
+const isFallbackLoginConfigured = Boolean(fallbackLoginEmail && fallbackLoginOtp);
+const emailTimeoutMs = Number.parseInt(process.env.EMAIL_TIMEOUT_MS || "10000", 10);
 
 const deleteInMemoryOtps = async (email: string) => {
   for (let i = inMemoryOtps.length - 1; i >= 0; i--) {
@@ -126,6 +133,35 @@ const createInMemoryUser = async (email: string) => {
   return user;
 };
 
+const findOrCreateUser = async (email: string) => {
+  let user = isDbReady()
+    ? await User.findOne({ email })
+    : await findInMemoryUserByEmail(email);
+
+  if (!user) {
+    user = isDbReady()
+      ? await new User({ email }).save()
+      : await createInMemoryUser(email);
+  }
+
+  return user;
+};
+
+const issueAuthCookie = (res: express.Response, user: any) => {
+  const token = jwt.sign(
+    { id: user._id, email: user.email },
+    process.env.JWT_SECRET || "magic_secret_key",
+    { expiresIn: "7d" }
+  );
+
+  res.cookie("token", token, {
+    httpOnly: true,
+    secure: true,
+    sameSite: "none",
+    maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
+  });
+};
+
 const createInMemoryAnalysis = async (data: any) => {
   const record = { _id: generateId(), ...data };
   inMemoryAnalysisHistory.unshift(record);
@@ -144,74 +180,89 @@ const listInMemoryAnalysisHistory = async () => {
   return inMemoryAnalysisHistory.slice(0, 2);
 };
 
-// Mail Transporter
-const transporter = nodemailer.createTransport({
-  host: process.env.SMTP_HOST || "smtp.gmail.com",
-  port: parseInt(process.env.SMTP_PORT || "587"),
-  secure: false,
-  auth: {
-    user: process.env.SMTP_USER,
-    pass: process.env.SMTP_PASS,
-  },
-});
-
 const sendOtpEmail = async (email: string, otp: string, html: string, text: string) => {
+  const deliveryErrors: string[] = [];
+
   if (process.env.RESEND_API_KEY) {
-    const response = await fetch("https://api.resend.com/emails", {
-      method: "POST",
-      headers: {
-        "Authorization": `Bearer ${process.env.RESEND_API_KEY}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        from: process.env.RESEND_FROM_EMAIL || "Sentilytics <onboarding@resend.dev>",
-        to: email,
-        subject: "Your Sentilytics Access Code",
-        html,
-        text,
-      }),
-    });
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), emailTimeoutMs);
 
-    if (!response.ok) {
-      const details = await response.text();
-      throw new Error(`Resend email failed (${response.status}): ${details}`);
+    try {
+      const response = await fetch("https://api.resend.com/emails", {
+        method: "POST",
+        signal: controller.signal,
+        headers: {
+          "Authorization": `Bearer ${process.env.RESEND_API_KEY}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          from: process.env.RESEND_FROM_EMAIL || "Sentilytics <onboarding@resend.dev>",
+          to: email,
+          subject: "Your Sentilytics Access Code",
+          html,
+          text,
+        }),
+      });
+
+      if (!response.ok) {
+        const details = await response.text();
+        throw new Error(`Resend email failed (${response.status}): ${details}`);
+      }
+
+      return;
+    } catch (err: any) {
+      deliveryErrors.push(`Resend: ${err.name === "AbortError" ? "request timed out" : err.message}`);
+    } finally {
+      clearTimeout(timeout);
     }
-
-    return;
   }
 
   if (!process.env.SMTP_USER || !process.env.SMTP_PASS) {
-    throw new Error("No email provider configured. Set RESEND_API_KEY or SMTP_USER/SMTP_PASS.");
+    const baseMessage = "No SMTP credentials configured. Set SMTP_USER/SMTP_PASS.";
+    throw new Error([...deliveryErrors, baseMessage].join(" | "));
   }
+
+  const smtpPort = Number.parseInt(process.env.SMTP_PORT || "587", 10);
+  const smtpSecure = process.env.SMTP_SECURE
+    ? process.env.SMTP_SECURE === "true"
+    : smtpPort === 465;
 
   const currentTransporter = nodemailer.createTransport({
     host: process.env.SMTP_HOST || "smtp.gmail.com",
-    port: parseInt(process.env.SMTP_PORT || "465"),
-    secure: false,
+    port: smtpPort,
+    secure: smtpSecure,
+    connectionTimeout: emailTimeoutMs,
+    greetingTimeout: emailTimeoutMs,
+    socketTimeout: emailTimeoutMs,
     auth: {
       user: process.env.SMTP_USER,
       pass: process.env.SMTP_PASS,
     },
   });
 
- console.log("SMTP CONFIG:", {
-  host: process.env.SMTP_HOST,
-  port: process.env.SMTP_PORT,
-  user: process.env.SMTP_USER,
-  hasPass: !!process.env.SMTP_PASS,
-});
+  try {
+    console.log("SMTP CONFIG:", {
+      host: process.env.SMTP_HOST || "smtp.gmail.com",
+      port: smtpPort,
+      secure: smtpSecure,
+      user: process.env.SMTP_USER,
+      hasPass: !!process.env.SMTP_PASS,
+    });
 
-await currentTransporter.verify();
+    await currentTransporter.verify();
+    console.log("SMTP VERIFIED");
 
-console.log("SMTP VERIFIED");
-
-await currentTransporter.sendMail({
-    from: `"Sentilytics Magic" <${process.env.SMTP_USER}>`,
-    to: email,
-    subject: "Your Sentilytics Access Code",
-    text,
-    html,
-  });
+    await currentTransporter.sendMail({
+      from: `"Sentilytics Magic" <${process.env.SMTP_USER}>`,
+      to: email,
+      subject: "Your Sentilytics Access Code",
+      text,
+      html,
+    });
+  } catch (err: any) {
+    deliveryErrors.push(`SMTP: ${err.message}`);
+    throw new Error(deliveryErrors.join(" | "));
+  }
 };
 
 const positiveSentimentLabels = new Set([
@@ -569,9 +620,11 @@ async function startServer() {
     console.log("POST /api/auth/send-otp received");
     console.log("Headers:", JSON.stringify(req.headers));
     console.log("Body:", JSON.stringify(req.body));
-    const { email } = req.body;
-    console.log("Email requested:", email);
-    if (!email) return res.status(400).json({ error: "Email is required" });
+    const requestedEmail = req.body.email;
+    console.log("Email requested:", requestedEmail);
+    if (!requestedEmail) return res.status(400).json({ error: "Email is required" });
+
+    const email = normalizeEmail(requestedEmail);
 
     const otp = Math.floor(100000 + Math.random() * 900000).toString();
     
@@ -601,10 +654,21 @@ async function startServer() {
         return res.json({ message: "OTP sent to your email" });
       } catch (mailErr: any) {
         console.error("Email delivery failed:", mailErr.message);
+        const fallbackMatches = isFallbackLoginConfigured && email === fallbackLoginEmail;
+
+        if (fallbackMatches) {
+          return res.json({
+            message: "Email delivery failed. Use the configured fallback OTP.",
+            fallback: true,
+          });
+        }
+
         if (process.env.NODE_ENV === "production") {
           return res.status(500).json({
             error: "Email delivery failed",
-            hint: "Check RESEND_API_KEY, RESEND_FROM_EMAIL, or SMTP settings.",
+            hint: isFallbackLoginConfigured
+              ? `Use the configured fallback login email if this mailbox cannot receive OTPs.`
+              : "Check RESEND_API_KEY, RESEND_FROM_EMAIL, SMTP settings, or configure FALLBACK_LOGIN_EMAIL and FALLBACK_LOGIN_OTP.",
           });
         }
 
@@ -627,10 +691,19 @@ async function startServer() {
   });
 
   app.post(["/api/auth/verify-otp", "/api/auth/verify-otp/"], async (req, res) => {
-    const { email, otp } = req.body;
-    if (!email || !otp) return res.status(400).json({ error: "Email and OTP are required" });
+    const requestedEmail = req.body.email;
+    const { otp } = req.body;
+    if (!requestedEmail || !otp) return res.status(400).json({ error: "Email and OTP are required" });
+
+    const email = normalizeEmail(requestedEmail);
 
     try {
+      if (isFallbackLoginConfigured && email === fallbackLoginEmail && otp === fallbackLoginOtp) {
+        const user = await findOrCreateUser(email);
+        issueAuthCookie(res, user);
+        return res.json({ user, fallback: true });
+      }
+
       const validOtp = isDbReady()
         ? await OTP.findOne({ email, otp })
         : await findInMemoryOtp(email, otp);
@@ -642,28 +715,8 @@ async function startServer() {
         await deleteInMemoryOtps(email);
       }
 
-      let user = isDbReady()
-        ? await User.findOne({ email })
-        : await findInMemoryUserByEmail(email);
-
-      if (!user) {
-        user = isDbReady()
-          ? await new User({ email }).save()
-          : await createInMemoryUser(email);
-      }
-
-      const token = jwt.sign(
-        { id: user._id, email: user.email },
-        process.env.JWT_SECRET || "magic_secret_key",
-        { expiresIn: "7d" }
-      );
-
-      res.cookie("token", token, {
-        httpOnly: true,
-        secure: true,
-        sameSite: "none",
-        maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
-      });
+      const user = await findOrCreateUser(email);
+      issueAuthCookie(res, user);
 
       res.json({ user });
     } catch (err) {

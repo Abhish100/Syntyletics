@@ -188,6 +188,7 @@ export default function App() {
   const [authLoading, setAuthLoading] = useState(false);
   const [devMode, setDevMode] = useState(false);
   const [devOtp, setDevOtp] = useState('');
+  const [fallbackMode, setFallbackMode] = useState(false);
 
   useEffect(() => {
     fetchHistory();
@@ -242,9 +243,15 @@ export default function App() {
         if (data.dev) {
           setDevMode(true);
           setDevOtp(data.otp || '');
+          setFallbackMode(false);
+        } else if (data.fallback) {
+          setDevMode(false);
+          setDevOtp('');
+          setFallbackMode(true);
         } else {
           setDevMode(false);
           setDevOtp('');
+          setFallbackMode(false);
         }
       } else {
         const text = await res.text();
@@ -285,6 +292,7 @@ export default function App() {
           setOtpSent(false);
           setOtp('');
           setLoginEmail('');
+          setFallbackMode(false);
         } catch (e) {
           console.error("Failed to parse verify JSON:", text);
           alert("Server error: Invalid response format");
@@ -831,6 +839,12 @@ export default function App() {
                     <div className="text-xl font-mono font-bold text-magic-gold tracking-widest">{devOtp}</div>
                   </div>
                 )}
+                {fallbackMode && (
+                  <div className="mt-4 p-4 bg-magic-gold/10 border border-magic-gold/20 rounded-xl text-center">
+                    <p className="text-xs text-magic-gold font-medium mb-1">Fallback Login Active</p>
+                    <p className="text-[10px] text-slate-400">Email delivery failed. Enter your configured fallback OTP to continue.</p>
+                  </div>
+                )}
               </div>
               <button 
                 disabled={authLoading}
@@ -842,7 +856,10 @@ export default function App() {
               </button>
               <button 
                 type="button"
-                onClick={() => setOtpSent(false)}
+                onClick={() => {
+                  setOtpSent(false);
+                  setFallbackMode(false);
+                }}
                 className="w-full py-2 text-slate-500 hover:text-slate-300 text-xs transition-colors font-medium"
               >
                 Change Email
